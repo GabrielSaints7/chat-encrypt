@@ -1,0 +1,138 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+generator client {
+  provider = "prisma-client-js"
+  // output   = "./generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// Atualizar model User para adicionar relações de grupos
+model User {
+  id        String   @id @default(uuid())
+  name      String
+  email     String   @unique
+  password  String
+  phone     String?
+  createdAt DateTime @default(now())
+
+  publicKeys        PublicKey[]
+  privateKeys       PrivateKey[]
+  sentMessages      Message[]      @relation("SentMessages")
+  receivedMessages  Message[]      @relation("ReceivedMessages")
+  groupMemberships  GroupMember[]
+  createdGroups     Group[]        @relation("GroupCreator")
+  sentGroupMessages GroupMessage[]
+}
+
+// Chaves públicas dos usuários (X25519)
+model PublicKey {
+  id        String   @id @default(uuid())
+  userId    String
+  publicKey String // Chave pública X25519 em base64
+  deviceId  String? // Identificador do dispositivo (opcional)
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, deviceId])
+  @@map("public_keys")
+}
+
+// NOVA TABELA
+model PrivateKey {
+  id                  String   @id @default(uuid())
+  userId              String
+  encryptedPrivateKey String   @db.Text // Chave privada cifrada com senha
+  salt                String // Salt usado no PBKDF2
+  iv                  String // IV usado na cifra
+  deviceId            String? // Identificador do dispositivo (opcional)
+  createdAt           DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+// Mensagens 1-para-1
+model Message {
+  id            String @id @default(uuid())
+  senderId      String
+  receiverId    String
+  encryptedData String @db.Text // Mensagem cifrada com AES-GCM
+  nonce         String // IV/Nonce para AES-GCM
+  senderEphemPk String // Chave pública efêmera do remetente (para Diffie-Hellman)
+
+  // Para o remetente (poder ver sua própria mensagem)
+  senderEncryptedData  String? @db.Text
+  senderNonce          String?
+  senderEphemPkForSelf String?
+
+  createdAt DateTime @default(now())
+
+  sender   User @relation("SentMessages", fields: [senderId], references: [id], onDelete: Cascade)
+  receiver User @relation("ReceivedMessages", fields: [receiverId], references: [id], onDelete: Cascade)
+
+  @@index([senderId, receiverId])
+  @@index([createdAt])
+  @@map("messages")
+}
+
+model Group {
+  id          String   @id @default(uuid())
+  name        String
+  creatorId   String
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  creator  User           @relation("GroupCreator", fields: [creatorId], references: [id], onDelete: Cascade)
+  members  GroupMember[]
+  messages GroupMessage[]
+
+  @@index([creatorId])
+}
+
+model GroupMember {
+  id      String @id @default(uuid())
+  groupId String
+  userId  String
+  role    String @default("member") // "admin" ou "member"
+
+  // Chave do grupo cifrada para este membro
+  encryptedGroupKey  String @db.Text
+  ephemeralPublicKey String // Chave efêmera usada para cifrar
+  keyVersion         Int    @default(1) // Versão da chave (muda ao remover membros)
+
+  joinedAt DateTime @default(now())
+
+  group Group @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([groupId, userId])
+  @@index([userId])
+  @@index([groupId])
+}
+
+model GroupMessage {
+  id            String   @id @default(uuid())
+  groupId       String
+  senderId      String
+  encryptedData String   @db.Text
+  nonce         String
+  keyVersion    Int // Versão da chave usada para cifrar
+  createdAt     DateTime @default(now())
+
+  group  Group @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  sender User  @relation(fields: [senderId], references: [id], onDelete: Cascade)
+
+  @@index([groupId])
+  @@index([senderId])
+}
