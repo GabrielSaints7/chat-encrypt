@@ -11,6 +11,7 @@ import {
 import { ChatService } from './chat.service';
 import { AddMemberDto } from './dto/add-member.dto';
 import { CreateGroupDto } from './dto/create-group.dto';
+import { RotateGroupKeyDto } from './dto/rotate-group-key.dto';
 
 @Controller('chat')
 export class ChatController {
@@ -77,5 +78,10 @@ export class ChatController {
   @Get('group/:groupId/members')
   async getGroupMembers(@Param('groupId') groupId: string) {
     return this.chatService.getGroupMembers(groupId);
+  }
+
+  @Post('group/rotate-key')
+  async rotateGroupKey(@Body() data: RotateGroupKeyDto) {
+    return this.chatService.rotateGroupKey(data);
   }
 }

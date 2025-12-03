@@ -6,16 +6,24 @@ import {
   ForbiddenException,
   Injectable,
   NotFoundException,
+  forwardRef,
+  Inject,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { SendMessageDto } from './dto/send-message.dto';
 import { SendGroupMessageDto } from './dto/send-group-message.dto';
 import { AddMemberDto } from './dto/add-member.dto';
 import { CreateGroupDto } from './dto/create-group.dto';
+import { RotateGroupKeyDto } from './dto/rotate-group-key.dto';
+import { ChatGateway } from './chat.gateway';
 
 @Injectable()
 export class ChatService {
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    private prisma: PrismaService,
+    @Inject(forwardRef(() => ChatGateway))
+    private chatGateway: ChatGateway,
+  ) {}
 
   async saveMessage(data: SendMessageDto) {
     const message = await this.prisma.message.create({
@@ -134,7 +142,7 @@ export class ChatService {
   // ========== GRUPOS ==========
 
   async createGroup(data: CreateGroupDto) {
-    console.log('👥 [CHAT-GROUP] Criando grupo:', data.name);
+    console.log('[CHAT-GROUP] Criando grupo:', data.name);
 
     // Criar grupo
     const group = await this.prisma.group.create({
@@ -167,6 +175,13 @@ export class ChatService {
 
     console.log(`[CHAT-GROUP] ${data.members.length} membros adicionados`);
 
+    // Notificar todos os membros (exceto o criador) via WebSocket
+    data.members.forEach((member) => {
+      if (member.userId !== data.creatorId) {
+        this.chatGateway.notifyGroupJoined(member.userId, group.id);
+      }
+    });
+
     return this.getGroupById(group.id);
   }
 
@@ -198,7 +213,7 @@ export class ChatService {
   }
 
   async getUserGroups(userId: string) {
-    console.log('👥 [CHAT-GROUP] Buscando grupos do usuário:', userId);
+    console.log('[CHAT-GROUP] Buscando grupos do usuário:', userId);
 
     const memberships = await this.prisma.groupMember.findMany({
       where: { userId },
@@ -282,6 +297,9 @@ export class ChatService {
 
     console.log('[CHAT-GROUP] Membro adicionado:', member.user.name);
 
+    // Notificar o novo membro via WebSocket
+    this.chatGateway.notifyGroupJoined(data.userId, data.groupId);
+
     return member;
   }
 
@@ -336,18 +354,55 @@ export class ChatService {
 
     console.log('[CHAT-GROUP] Membro removido');
 
+    // Notificar o membro removido via WebSocket
+    this.chatGateway.notifyGroupLeft(userId, groupId);
+
     // Se não sobrou ninguém, deletar grupo
-    const remainingMembers = await this.prisma.groupMember.count({
+    const remainingMembersCount = await this.prisma.groupMember.count({
       where: { groupId },
     });
 
-    if (remainingMembers === 0) {
+    if (remainingMembersCount === 0) {
       await this.prisma.group.delete({ where: { id: groupId } });
       console.log('[CHAT-GROUP] Grupo vazio deletado');
-      return { deleted: true };
+      return { deleted: true, shouldRotateKey: false, remainingMembers: [] };
     }
 
-    return { deleted: false };
+    // Buscar membros restantes com suas chaves públicas para Geração de chave
+    const remainingMembers = await this.prisma.groupMember.findMany({
+      where: { groupId },
+      include: {
+        user: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
+            publicKeys: true,
+          },
+        },
+      },
+    });
+
+    const currentMaxVersion = Math.max(
+      ...remainingMembers.map((m) => m.keyVersion),
+    );
+
+    console.log(
+      '[CHAT-GROUP] Geração de chave necessária para',
+      remainingMembers.length,
+      'membros',
+    );
+
+    return {
+      deleted: false,
+      shouldRotateKey: true,
+      currentKeyVersion: currentMaxVersion,
+      remainingMembers: remainingMembers.map((m) => ({
+        userId: m.userId,
+        userName: m.user.name,
+        publicKey: m.user.publicKeys[0]?.publicKey,
+      })),
+    };
   }
 
   async deleteGroup(groupId: string, userId: string) {
@@ -456,12 +511,98 @@ export class ChatService {
       where: { groupId },
       include: {
         user: {
-          select: { id: true, name: true, email: true },
-          include: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
             publicKeys: true,
           },
         },
       },
     });
+  }
+
+  /**
+   * Rotaciona a chave do grupo (incrementa keyVersion e atualiza chaves de todos os membros)
+   * Deve ser chamado quando um membro é removido para garantir segurança forward
+   */
+  async rotateGroupKey(data: RotateGroupKeyDto) {
+    console.log('\n BACKEND: Geração de chave');
+    console.log('   Grupo:', data.groupId);
+    console.log('   Nova versão:', data.newKeyVersion);
+    console.log('   Membros:', data.memberKeys.length);
+
+    // Verificar se quem está rotacionando é admin
+    const rotatorMember = await this.prisma.groupMember.findUnique({
+      where: {
+        groupId_userId: {
+          groupId: data.groupId,
+          userId: data.rotatedBy,
+        },
+      },
+    });
+
+    if (!rotatorMember || rotatorMember.role !== 'admin') {
+      throw new ForbiddenException(
+        'Apenas administradores podem rotacionar a chave do grupo',
+      );
+    }
+
+    // Verificar se o grupo existe
+    const group = await this.prisma.group.findUnique({
+      where: { id: data.groupId },
+      include: { members: true },
+    });
+
+    if (!group) {
+      throw new NotFoundException('Grupo não encontrado');
+    }
+
+    // Verificar se a nova versão é maior que a atual
+    const currentMaxVersion = Math.max(...group.members.map((m) => m.keyVersion));
+
+    console.log('   Versão anterior:', currentMaxVersion);
+
+    if (data.newKeyVersion <= currentMaxVersion) {
+      throw new ForbiddenException(
+        `Nova versão de chave (${data.newKeyVersion}) deve ser maior que a atual (${currentMaxVersion})`,
+      );
+    }
+
+    // Atualizar a chave de cada membro usando transação
+    await this.prisma.$transaction(
+      data.memberKeys.map((memberKey) =>
+        this.prisma.groupMember.update({
+          where: {
+            groupId_userId: {
+              groupId: data.groupId,
+              userId: memberKey.userId,
+            },
+          },
+          data: {
+            encryptedGroupKey: memberKey.encryptedGroupKey,
+            ephemeralPublicKey: memberKey.ephemeralPublicKey,
+            keyVersion: data.newKeyVersion,
+          },
+        }),
+      ),
+    );
+
+    // Notificar todos os membros sobre a nova chave via WebSocket
+    data.memberKeys.forEach((memberKey) => {
+      this.chatGateway.notifyGroupKeyRotated(
+        memberKey.userId,
+        data.groupId,
+        data.newKeyVersion,
+      );
+    });
+
+    console.log(' Geração concluída!\n');
+
+    return {
+      success: true,
+      newKeyVersion: data.newKeyVersion,
+      membersUpdated: data.memberKeys.length,
+    };
   }
 }

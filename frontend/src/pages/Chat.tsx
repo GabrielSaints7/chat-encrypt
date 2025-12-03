@@ -76,17 +76,33 @@ export function Chat() {
   useEffect(() => {
     if (!user) return;
 
-    console.log("🔌 [CHAT] Inicializando...");
+    console.log(" [CHAT] Inicializando...");
 
     // Conectar WebSocket
     const sock = socketService.connect(user.id);
     setSocket(sock);
 
     // Listener para mensagens 1-1
-    const unsubscribe = socketService.onMessage((data) => {
+    const unsubscribe1on1 = socketService.onMessage((data) => {
       if (data.receiverId === user.id && !data.groupId) {
         console.log("[CHAT] Mensagem 1-1 recebida");
         decryptAndAddMessage(data);
+      }
+    });
+
+    // Listener para quando for adicionado a um grupo
+    const unsubscribeGroupJoined = socketService.onGroupJoined((data) => {
+      console.log("[CHAT] Adicionado a um novo grupo:", data.groupId);
+      loadUserGroups(); // Recarregar lista de grupos
+    });
+
+    // Listener para quando for removido de um grupo
+    const unsubscribeGroupLeft = socketService.onGroupLeft((data) => {
+      console.log("[CHAT] Removido de um grupo:", data.groupId);
+      loadUserGroups(); // Recarregar lista de grupos
+      // Se estava visualizando esse grupo, voltar para lista
+      if (selectedGroup?.id === data.groupId) {
+        setSelectedGroup(null);
       }
     });
 
@@ -95,7 +111,9 @@ export function Chat() {
     loadUserGroups();
 
     return () => {
-      unsubscribe();
+      unsubscribe1on1();
+      unsubscribeGroupJoined();
+      unsubscribeGroupLeft();
     };
   }, [user?.id]);
 
@@ -437,7 +455,7 @@ export function Chat() {
 
   const loadUserGroups = async () => {
     try {
-      console.log("👥 [CHAT] Carregando grupos...");
+      console.log("[CHAT] Carregando grupos...");
 
       const response = await fetch(
         `http://localhost:3000/chat/user/${user!.id}/groups`
@@ -515,7 +533,7 @@ export function Chat() {
                   : "bg-gray-100 hover:bg-gray-200"
               }`}
             >
-              👥 Grupos
+              Grupos
             </button>
           </div>
         </div>
@@ -530,7 +548,7 @@ export function Chat() {
                   onClick={() => setShowAddChat(true)}
                   className="w-full py-2 px-4 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
                 >
-                  ➕ Adicionar Contato
+                  Adicionar Contato
                 </button>
               </div>
 
@@ -567,7 +585,7 @@ export function Chat() {
                   onClick={() => setShowCreateGroup(true)}
                   className="w-full py-2 px-4 bg-green-600 text-white rounded-lg hover:bg-green-700"
                 >
-                  ➕ Criar Grupo
+                  Criar Grupo
                 </button>
               </div>
 

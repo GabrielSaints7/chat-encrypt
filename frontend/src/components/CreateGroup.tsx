@@ -27,7 +27,7 @@ export function CreateGroup({ onClose, onGroupCreated }: CreateGroupProps) {
         throw new Error("Nome do grupo é obrigatório");
       }
 
-      console.log("👥 [GROUP] Criando grupo:", groupName);
+      console.log("[GROUP] Criando grupo:", groupName);
 
       // 1. Parse dos emails dos membros
       const emails = memberEmails
@@ -35,7 +35,7 @@ export function CreateGroup({ onClose, onGroupCreated }: CreateGroupProps) {
         .map((email) => email.trim())
         .filter((email) => email.length > 0);
 
-      console.log(`👥 [GROUP] Membros a adicionar: ${emails.length}`);
+      console.log(`[GROUP] Membros a adicionar: ${emails.length}`);
 
       // 2. Buscar dados dos membros
       const memberPromises = emails.map(async (email) => {
@@ -60,8 +60,14 @@ export function CreateGroup({ onClose, onGroupCreated }: CreateGroupProps) {
         ...members.map((m) => ({ id: m.id, publicKey: m.publicKey })),
       ];
 
+      // Remove duplicates by userId (in case user included their own email)
+      const uniqueMembers = allMembers.filter(
+        (member, index, self) =>
+          index === self.findIndex((m) => m.id === member.id)
+      );
+
       console.log(
-        `👥 [GROUP] Total de membros (incluindo eu): ${allMembers.length}`
+        `[GROUP] Total de membros únicos (incluindo eu): ${uniqueMembers.length}`
       );
 
       // 4. Gerar chave do grupo
@@ -71,7 +77,7 @@ export function CreateGroup({ onClose, onGroupCreated }: CreateGroupProps) {
 
       // 5. Cifrar chave do grupo para cada membro
       console.log("[GROUP] Cifrando chave para cada membro...");
-      const memberKeysPromises = allMembers.map(async (member) => {
+      const memberKeysPromises = uniqueMembers.map(async (member) => {
         const memberPublicKeyRaw = CryptoService.base64ToArrayBuffer(
           member.publicKey
         );

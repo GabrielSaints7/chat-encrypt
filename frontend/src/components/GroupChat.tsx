@@ -4,6 +4,7 @@ import { useState, useEffect, useRef } from "react";
 import { useAuth } from "../contexts/AuthContext";
 import { CryptoService } from "../services/crypto.service";
 import socketService from "../services/socket.service";
+import { chatApi } from "../api/api";
 
 interface GroupChatProps {
   group: any;
@@ -34,17 +35,170 @@ export function GroupChat({ group, onBack }: GroupChatProps) {
   // Carregar chave do grupo e mensagens
   useEffect(() => {
     loadGroupKeyAndMessages();
-
-    // Listener para mensagens novas
-    const unsubscribe = socketService.onMessage((data) => {
-      if (data.groupId === group.id) {
-        console.log("👥 [GROUP-CHAT] Nova mensagem de grupo recebida");
-        decryptAndAddMessage(data);
-      }
-    });
-
-    return () => unsubscribe();
   }, [group.id]);
+
+  // Listener para mensagens novas de grupo
+  useEffect(() => {
+    console.log("[GROUP-CHAT] Registrando listener de mensagens para grupo:", group.id);
+
+    const socket = socketService.getSocket();
+    if (!socket) {
+      console.error("[GROUP-CHAT] Socket não está conectado!");
+      return;
+    }
+
+    const handleGroupMessage = async (data: any) => {
+      console.log("📨 [GROUP-CHAT] Evento group:message:receive recebido:", data);
+      if (data.groupId !== group.id) {
+        console.log("⏭️ [GROUP-CHAT] Mensagem de outro grupo, ignorando");
+        return;
+      }
+
+      console.log(" [GROUP-CHAT] Mensagem é do grupo atual, descriptografando...");
+
+      // Aguardar a chave do grupo se ainda não estiver disponível
+      let currentGroupKey = groupKey;
+      if (!currentGroupKey) {
+        console.log("[GROUP-CHAT] Chave do grupo não disponível ainda, buscando do localStorage...");
+        try {
+          const groupKeys = JSON.parse(localStorage.getItem("groupKeys") || "{}");
+          const groupKeyB64 = groupKeys[group.id];
+          if (groupKeyB64) {
+            const groupKeyRaw = CryptoService.base64ToArrayBuffer(groupKeyB64);
+            currentGroupKey = await CryptoService.importGroupKey(groupKeyRaw);
+            console.log("[GROUP-CHAT] Chave do grupo recuperada do localStorage");
+          } else {
+            console.error("[GROUP-CHAT] Chave do grupo não encontrada no localStorage");
+            return;
+          }
+        } catch (error) {
+          console.error("[GROUP-CHAT] Erro ao recuperar chave do grupo:", error);
+          return;
+        }
+      }
+
+      try {
+        const decryptedText = await CryptoService.decryptGroupMessage(
+          data.encryptedData,
+          data.nonce,
+          currentGroupKey
+        );
+
+        const message: GroupMessage = {
+          id: data.id,
+          senderId: data.senderId,
+          senderName: data.senderName,
+          text: decryptedText,
+          createdAt: new Date(data.createdAt),
+          decrypted: true,
+        };
+
+        setMessages((prev) => {
+          const exists = prev.some((m) => m.id === message.id);
+          if (exists) {
+            console.log("[GROUP-CHAT] Mensagem já existe, ignorando duplicata");
+            return prev;
+          }
+          console.log("[GROUP-CHAT] Adicionando nova mensagem:", message.id);
+          return [...prev, message];
+        });
+      } catch (error) {
+        console.error("[GROUP-CHAT] Erro ao descriptografar mensagem:", error);
+      }
+    };
+
+    const unsubscribeGroupMsg = socketService.onGroupMessage(handleGroupMessage);
+
+    // Listener para confirmação de envio
+    const handleSent = (data: any) => {
+      console.log(" [GROUP-CHAT] Confirmação de envio recebida:", data);
+    };
+
+    // Listener para erro de envio
+    const handleError = (data: any) => {
+      console.error("[GROUP-CHAT] Erro ao enviar mensagem:", data);
+      alert("Erro ao enviar mensagem: " + data.message);
+    };
+
+    // Listener para Geração de chave do grupo
+    const handleKeyRotated = async (data: {
+      groupId: string;
+      newKeyVersion: number;
+    }) => {
+      if (data.groupId !== group.id) return;
+
+      console.log("\n NOTIFICAÇÃO: Chave rotacionada remotamente");
+
+      // Obter fingerprint da chave antiga
+      let oldKeyFingerprint = "N/A";
+      if (groupKey) {
+        oldKeyFingerprint = await CryptoService.getKeyFingerprint(groupKey);
+      }
+
+      try {
+        // Recarregar informações do grupo para obter a nova chave cifrada
+        const response = await fetch(
+          `http://localhost:3000/chat/group/${group.id}`
+        );
+        const updatedGroup = await response.json();
+
+        // Encontrar minha entrada de membro
+        const myMembership = updatedGroup.members.find(
+          (m: any) => m.userId === user!.id
+        );
+
+        if (!myMembership) {
+          console.error("Não encontrado como membro após Geração");
+          return;
+        }
+
+        // Decifrar nova chave
+        const newGroupKeyRaw = await CryptoService.decryptGroupKey(
+          myMembership.encryptedGroupKey,
+          myMembership.ephemeralPublicKey,
+          privateKey!
+        );
+
+        const newGroupKey = await CryptoService.importGroupKey(newGroupKeyRaw);
+        const newKeyFingerprint = await CryptoService.getKeyFingerprint(newGroupKeyRaw);
+
+        // Atualizar estado
+        setGroupKey(newGroupKey);
+
+        // Atualizar localStorage
+        const groupKeyB64 = CryptoService.arrayBufferToBase64(newGroupKeyRaw);
+        const groupKeys = JSON.parse(localStorage.getItem("groupKeys") || "{}");
+        groupKeys[group.id] = groupKeyB64;
+        localStorage.setItem("groupKeys", JSON.stringify(groupKeys));
+
+        console.log(" COMPARAÇÃO:");
+        console.log("   Chave ANTIGA:", oldKeyFingerprint);
+        console.log("   Chave NOVA:  ", newKeyFingerprint);
+        console.log(" Chave atualizada localmente!\n");
+
+        alert(
+          `A chave do grupo foi rotacionada (nova versão: ${data.newKeyVersion}). Suas mensagens continuarão funcionando normalmente.`
+        );
+      } catch (error) {
+        console.error("Erro ao atualizar chave:", error);
+        alert(
+          "Erro ao atualizar chave do grupo. Por favor, saia e entre novamente no grupo."
+        );
+      }
+    };
+
+    socket.on("group:message:sent", handleSent);
+    socket.on("group:message:error", handleError);
+    socket.on("group:key:rotated", handleKeyRotated);
+
+    return () => {
+      console.log("[GROUP-CHAT] Removendo listeners de mensagens");
+      unsubscribeGroupMsg();
+      socket.off("group:message:sent", handleSent);
+      socket.off("group:message:error", handleError);
+      socket.off("group:key:rotated", handleKeyRotated);
+    };
+  }, [group.id]); // Removido groupKey das dependências
 
   // Auto-scroll
   useEffect(() => {
@@ -122,43 +276,11 @@ export function GroupChat({ group, onBack }: GroupChatProps) {
 
       setMessages(decryptedMessages);
       console.log("[GROUP-CHAT] Mensagens carregadas");
-    } catch (error) {
+    } catch (error: any) {
       console.error("[GROUP-CHAT] Erro:", error);
       alert("Erro ao carregar grupo: " + error.message);
     } finally {
       setLoading(false);
-    }
-  };
-
-  const decryptAndAddMessage = async (encryptedMessage: any) => {
-    try {
-      if (!groupKey) {
-        console.error("[GROUP-CHAT] Chave do grupo não disponível");
-        return;
-      }
-
-      const decryptedText = await CryptoService.decryptGroupMessage(
-        encryptedMessage.encryptedData,
-        encryptedMessage.nonce,
-        groupKey
-      );
-
-      const message: GroupMessage = {
-        id: encryptedMessage.id,
-        senderId: encryptedMessage.senderId,
-        senderName: encryptedMessage.senderName,
-        text: decryptedText,
-        createdAt: new Date(encryptedMessage.createdAt),
-        decrypted: true,
-      };
-
-      setMessages((prev) => {
-        const exists = prev.some((m) => m.id === message.id);
-        if (exists) return prev;
-        return [...prev, message];
-      });
-    } catch (error) {
-      console.error("[GROUP-CHAT] Erro ao descriptografar:", error);
     }
   };
 
@@ -179,7 +301,14 @@ export function GroupChat({ group, onBack }: GroupChatProps) {
       );
 
       // Enviar via WebSocket
-      socketService.getSocket()?.emit("group:message:send", {
+      console.log("[GROUP-CHAT] Emitindo evento group:message:send...");
+      const socket = socketService.getSocket();
+
+      if (!socket || !socket.connected) {
+        throw new Error("WebSocket não está conectado");
+      }
+
+      socket.emit("group:message:send", {
         groupId: group.id,
         senderId: user!.id,
         encryptedData,
@@ -187,21 +316,13 @@ export function GroupChat({ group, onBack }: GroupChatProps) {
         keyVersion: group.myKeyVersion || 1,
       });
 
-      // Adicionar à lista local
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: Date.now().toString(),
-          senderId: user!.id,
-          senderName: user!.name,
-          text: messageInput,
-          createdAt: new Date(),
-          decrypted: true,
-        },
-      ]);
+      console.log("[GROUP-CHAT] Evento emitido, aguardando confirmação...");
 
+      // Limpar input imediatamente para melhor UX
       setMessageInput("");
-      console.log("[GROUP-CHAT] Mensagem enviada");
+
+      // A mensagem será adicionada quando receber o evento group:message:receive
+      // Isso garante sincronização e previne duplicatas
     } catch (error) {
       console.error("[GROUP-CHAT] Erro ao enviar:", error);
       alert("Erro ao enviar mensagem");
@@ -214,7 +335,7 @@ export function GroupChat({ group, onBack }: GroupChatProps) {
     try {
       if (!newMemberEmail.trim()) return;
 
-      console.log("➕ [GROUP-CHAT] Adicionando membro:", newMemberEmail);
+      console.log("[GROUP-CHAT] Adicionando membro:", newMemberEmail);
 
       // 1. Buscar usuário
       const userResponse = await fetch(
@@ -265,6 +386,83 @@ export function GroupChat({ group, onBack }: GroupChatProps) {
     } catch (error: any) {
       console.error("[GROUP-CHAT] Erro:", error);
       alert("Erro: " + error.message);
+    }
+  };
+
+  /**
+   * Rotaciona a chave do grupo após remover um membro
+   * Gera nova chave AES, cifra para cada membro restante e atualiza no servidor
+   */
+  const rotateGroupKey = async (
+    groupId: string,
+    remainingMembers: Array<{ userId: string; userName: string; publicKey: string }>,
+    currentKeyVersion: number
+  ) => {
+    try {
+      console.log("\n Geração DE CHAVE - Iniciada");
+
+      // Obter fingerprint da chave antiga
+      let oldKeyFingerprint = "N/A";
+      if (groupKey) {
+        oldKeyFingerprint = await CryptoService.getKeyFingerprint(groupKey);
+      }
+
+      // 1. Gerar nova chave de grupo
+      const newGroupKey = await CryptoService.generateGroupKey();
+      const newGroupKeyRaw = await CryptoService.exportGroupKey(newGroupKey);
+      const newKeyVersion = currentKeyVersion + 1;
+
+      // Obter fingerprint da nova chave
+      const newKeyFingerprint = await CryptoService.getKeyFingerprint(newGroupKeyRaw);
+
+      console.log(" COMPARAÇÃO:");
+      console.log("   Chave ANTIGA:", oldKeyFingerprint);
+      console.log("   Chave NOVA:  ", newKeyFingerprint);
+      console.log("   Versão:", currentKeyVersion, "→", newKeyVersion);
+
+      // 2. Cifrar a nova chave para cada membro restante
+      const memberKeys = [];
+      for (const member of remainingMembers) {
+        const memberPublicKeyRaw = CryptoService.base64ToArrayBuffer(
+          member.publicKey
+        );
+
+        const { encryptedGroupKey, ephemeralPublicKey } =
+          await CryptoService.encryptGroupKeyForMember(
+            newGroupKeyRaw,
+            memberPublicKeyRaw
+          );
+
+        memberKeys.push({
+          userId: member.userId,
+          encryptedGroupKey,
+          ephemeralPublicKey,
+        });
+      }
+
+      // 3. Enviar para o servidor
+      await chatApi.rotateGroupKey({
+        groupId,
+        rotatedBy: user!.id,
+        newKeyVersion,
+        memberKeys,
+      });
+
+      // 4. Atualizar chave local
+      const groupKeyB64 = CryptoService.arrayBufferToBase64(newGroupKeyRaw);
+      const groupKeys = JSON.parse(localStorage.getItem("groupKeys") || "{}");
+      groupKeys[groupId] = groupKeyB64;
+      localStorage.setItem("groupKeys", JSON.stringify(groupKeys));
+
+      // 5. Atualizar estado local
+      setGroupKey(newGroupKey);
+
+      console.log(" Geração concluída!\n");
+
+      return true;
+    } catch (error: any) {
+      console.error("Erro ao rotacionar chave:", error);
+      throw error;
     }
   };
 
@@ -357,7 +555,7 @@ export function GroupChat({ group, onBack }: GroupChatProps) {
             onClick={() => setShowMembers(!showMembers)}
             className="px-3 py-1 text-sm bg-gray-100 rounded hover:bg-gray-200"
           >
-            👥 Membros
+            Membros
           </button>
 
           {isAdmin && (
@@ -366,7 +564,7 @@ export function GroupChat({ group, onBack }: GroupChatProps) {
                 onClick={() => setShowAddMember(!showAddMember)}
                 className="px-3 py-1 text-sm bg-blue-100 text-blue-700 rounded hover:bg-blue-200"
               >
-                ➕ Adicionar
+                Adicionar
               </button>
               <button
                 onClick={handleDeleteGroup}
@@ -434,18 +632,57 @@ export function GroupChat({ group, onBack }: GroupChatProps) {
                     onClick={async () => {
                       if (confirm(`Remover ${member.user.name}?`)) {
                         try {
-                          await fetch(
-                            `http://localhost:3000/chat/group/${group.id}/member/${member.userId}`,
-                            {
-                              method: "DELETE",
-                              headers: { "Content-Type": "application/json" },
-                              body: JSON.stringify({ removedBy: user!.id }),
-                            }
+                          console.log(
+                            "[GROUP-CHAT] Removendo membro:",
+                            member.user.name
                           );
-                          alert("Membro removido");
+
+                          // 1. Remover membro via API
+                          const result = await chatApi.removeGroupMember(
+                            group.id,
+                            member.userId,
+                            user!.id
+                          );
+
+                          console.log(
+                            "[GROUP-CHAT] Membro removido:",
+                            result
+                          );
+
+                          // 2. Se necessário, rotacionar a chave
+                          if (
+                            result.shouldRotateKey &&
+                            result.remainingMembers
+                          ) {
+                            console.log(
+                              "[GROUP-CHAT] Rotacionando chave do grupo..."
+                            );
+
+                            await rotateGroupKey(
+                              group.id,
+                              result.remainingMembers,
+                              result.currentKeyVersion!
+                            );
+
+                            alert(
+                              `${member.user.name} removido e chave do grupo rotacionada!`
+                            );
+                          } else if (result.deleted) {
+                            alert("Grupo deletado (sem membros restantes)");
+                            onBack();
+                            return;
+                          } else {
+                            alert(`${member.user.name} removido!`);
+                          }
+
+                          // 3. Recarregar página para atualizar lista de membros
                           window.location.reload();
-                        } catch (error) {
-                          alert("Erro ao remover membro");
+                        } catch (error: any) {
+                          console.error(
+                            "[GROUP-CHAT] Erro ao remover membro:",
+                            error
+                          );
+                          alert("Erro ao remover membro: " + error.message);
                         }
                       }
                     }}

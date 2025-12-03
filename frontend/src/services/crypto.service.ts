@@ -373,11 +373,14 @@ export class CryptoService {
         ["deriveBits", "deriveKey"]
       );
 
+      // Garantir que salt seja Uint8Array
+      const saltBytes = new Uint8Array(salt);
+
       // Derivar chave AES usando PBKDF2
       const derivedKey = await crypto.subtle.deriveKey(
         {
           name: "PBKDF2",
-          salt: salt,
+          salt: saltBytes,
           iterations: 100000, // 100k iterações
           hash: "SHA-256",
         },
@@ -453,7 +456,7 @@ export class CryptoService {
         salt: this.arrayBufferToBase64(salt),
         iv: this.arrayBufferToBase64(iv),
       };
-    } catch (error) {
+    } catch (error: any) {
       console.error("[CRYPTO] Erro ao cifrar chave privada:", error);
       console.error("  Detalhes:", error.message);
       throw error;
@@ -522,7 +525,7 @@ export class CryptoService {
       console.log("[CRYPTO] Chave privada decifrada com sucesso");
 
       return privateKey;
-    } catch (error) {
+    } catch (error: any) {
       console.error("[CRYPTO] Erro ao decifrar chave privada:", error);
       console.error("  Detalhes:", error.message);
 
@@ -535,6 +538,38 @@ export class CryptoService {
   }
 
   // ADICIONAR estas funções ao final da classe CryptoService:
+
+  // ============= FUNÇÕES UTILITÁRIAS =============
+
+  /**
+   * Gera hash SHA-256 de uma chave para comparação visual (não para segurança)
+   * Retorna primeiros 16 caracteres do hash em hex
+   */
+  static async getKeyFingerprint(key: CryptoKey | ArrayBuffer): Promise<string> {
+    try {
+      let keyBytes: ArrayBuffer;
+
+      if (key instanceof CryptoKey) {
+        // Exportar chave para raw bytes
+        keyBytes = await crypto.subtle.exportKey("raw", key);
+      } else {
+        keyBytes = key;
+      }
+
+      // Gerar hash SHA-256
+      const hashBuffer = await crypto.subtle.digest("SHA-256", keyBytes);
+      const hashArray = Array.from(new Uint8Array(hashBuffer));
+      const hashHex = hashArray
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
+
+      // Retornar primeiros 16 caracteres
+      return hashHex.substring(0, 16);
+    } catch (error) {
+      console.error("[CRYPTO] Erro ao gerar fingerprint:", error);
+      return "error";
+    }
+  }
 
   // ============= FUNÇÕES DE GRUPO =============
 

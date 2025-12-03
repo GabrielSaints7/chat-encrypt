@@ -85,7 +85,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     phone: string,
     password: string
   ) => {
-    console.log("📝 [AUTH] Iniciando registro...");
+    console.log("[AUTH] Iniciando registro...");
 
     try {
       // Gerar par de chaves ECDH
